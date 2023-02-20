@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "aiogram-fastapi-server"
+version = "0.1.0"
+description = "Handle webhook requests with FastAPI instead of aiohttp"
+authors = ["Snimshchikov Ilya <snimshchikov.ilya@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "aiogram_fastapi_server"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fastapi = "*"
+aiogram = {version = "^3.0.0b1", allow-prereleases = true}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
