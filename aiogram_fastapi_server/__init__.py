@@ -1,21 +1,15 @@
 import asyncio
-import secrets
 from abc import ABC, abstractmethod
-from asyncio import Transport
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from aiohttp import MultipartWriter, web
-from aiohttp.abc import Application
-from aiohttp.typedefs import Handler
-from aiohttp.web_middlewares import middleware
+from fastapi import FastAPI, Request, Response, HTTPException, status
 
 from aiogram import Bot, Dispatcher, loggers
-from aiogram.methods import Request, TelegramMethod
-from aiogram.types import UNSET
+from aiogram.methods import TelegramMethod
 from aiogram.webhook.security import IPFilter
 
 
-def setup_application(app: Application, dispatcher: Dispatcher, /, **kwargs: Any) -> None:
+def setup_application(app: FastAPI, dispatcher: Dispatcher, /, **kwargs: Any) -> None:
     """
     This function helps to configure startup-shutdown process
 
@@ -37,11 +31,11 @@ def setup_application(app: Application, dispatcher: Dispatcher, /, **kwargs: Any
     async def on_shutdown(*a: Any, **kw: Any) -> None:  # pragma: no cover
         await dispatcher.emit_shutdown(**workflow_data)
 
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+    app.add_event_handler("startup", on_startup)
+    app.add_event_handler("shutdown", on_shutdown)
 
 
-def check_ip(ip_filter: IPFilter, request: web.Request) -> Tuple[str, bool]:
+def check_ip(ip_filter: IPFilter, request: Request) -> Tuple[str, bool]:
     # Try to resolve client IP over reverse proxy
     if forwarded_for := request.headers.get("X-Forwarded-For", ""):
         # Get the left-most ip when there is multiple ips
@@ -51,7 +45,7 @@ def check_ip(ip_filter: IPFilter, request: web.Request) -> Tuple[str, bool]:
         return forwarded_for, forwarded_for in ip_filter
 
     # When reverse proxy is not configured IP address can be resolved from incoming connection
-    if peer_name := cast(Transport, request.transport).get_extra_info("peername"):
+    if peer_name := request.client.host:
         host, _ = peer_name
         return host, host in ip_filter
 
@@ -61,19 +55,18 @@ def check_ip(ip_filter: IPFilter, request: web.Request) -> Tuple[str, bool]:
 
 def ip_filter_middleware(
     ip_filter: IPFilter,
-) -> Callable[[web.Request, Handler], Awaitable[Any]]:
+) -> Callable[[Request, Any], Awaitable[Any]]:
     """
 
     :param ip_filter:
     :return:
     """
 
-    @middleware
-    async def _ip_filter_middleware(request: web.Request, handler: Handler) -> Any:
+    async def _ip_filter_middleware(request: Request, handler) -> Any:
         ip_address, accept = check_ip(ip_filter=ip_filter, request=request)
         if not accept:
-            loggers.webhook.warning("Blocking request from an unauthorized IP: %s", ip_address)
-            raise web.HTTPUnauthorized()
+            loggers.webhook.warning(f"Blocking request from an unauthorized IP: {ip_address}")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
         return await handler(request)
 
     return _ip_filter_middleware
@@ -86,21 +79,17 @@ class BaseRequestHandler(ABC):
     """
 
     def __init__(
-        self,
-        dispatcher: Dispatcher,
-        handle_in_background: bool = False,
-        **data: Any,
+        self, dispatcher: Dispatcher, handle_in_background: bool = True, **data: Any
     ) -> None:
         """
         :param dispatcher: instance of :class:`aiogram.dispatcher.dispatcher.Dispatcher`
-        :param handle_in_background: immediately respond to the Telegram instead of
-            waiting end of handler process
+        :param handle_in_background: immediately respond to the Telegram instead of waiting end of handler process
         """
         self.dispatcher = dispatcher
         self.handle_in_background = handle_in_background
         self.data = data
 
-    def register(self, app: Application, /, path: str, **kwargs: Any) -> None:
+    def register(self, app: FastAPI, /, path: str, **kwargs: Any) -> None:
         """
         Register route and shutdown callback
 
@@ -108,10 +97,10 @@ class BaseRequestHandler(ABC):
         :param path: route path
         :param kwargs:
         """
-        app.on_shutdown.append(self._handle_close)
-        app.router.add_route("POST", path, self.handle, **kwargs)
+        app.add_event_handler("shutdown", self._handle_close)
+        app.add_route("POST", path, self.handle, **kwargs)
 
-    async def _handle_close(self, app: Application) -> None:
+    async def _handle_close(self, app: FastAPI) -> None:
         await self.close()
 
     @abstractmethod
@@ -119,7 +108,7 @@ class BaseRequestHandler(ABC):
         pass
 
     @abstractmethod
-    async def resolve_bot(self, request: web.Request) -> Bot:
+    async def resolve_bot(self, request: Request) -> Bot:
         """
         This method should be implemented in subclasses of this class.
 
@@ -135,49 +124,25 @@ class BaseRequestHandler(ABC):
         if isinstance(result, TelegramMethod):
             await self.dispatcher.silent_call_request(bot=bot, result=result)
 
-    async def _handle_request_background(self, bot: Bot, request: web.Request) -> web.Response:
+    async def _handle_request_background(self, bot: Bot, request: Request) -> Response:
         asyncio.create_task(
             self._background_feed_update(
-                bot=bot, update=await request.json(loads=bot.session.json_loads)
+                bot=bot, update=bot.session.json_loads(await request.body())
             )
         )
-        return web.json_response({}, dumps=bot.session.json_dumps)
+        return Response(bot.session.json_dumps({}), media_type="application/json")
 
-    def _build_response_writer(self, bot: Bot, result: Optional[Request]) -> MultipartWriter:
-        writer = MultipartWriter(
-            "form-data",
-            boundary=f"webhookBoundary{secrets.token_urlsafe(16)}",
-        )
-        if not result:
-            return writer
-
-        payload = writer.append(result.method)
-        payload.set_content_disposition("form-data", name="method")
-
-        for key, value in result.data.items():
-            if value is None or value is UNSET:
-                continue
-            payload = writer.append(bot.session.prepare_value(value))
-            payload.set_content_disposition("form-data", name=key)
-
-        if not result.files:
-            return writer
-
-        for key, value in result.files.items():
-            payload = writer.append(value)
-            payload.set_content_disposition("form-data", name=key, filename=value.filename)
-
-        return writer
-
-    async def _handle_request(self, bot: Bot, request: web.Request) -> web.Response:
+    async def _handle_request(self, bot: Bot, request: Request) -> Response:
         result = await self.dispatcher.feed_webhook_update(
             bot,
-            await request.json(loads=bot.session.json_loads),
+            bot.session.json_loads(await request.body()),
             **self.data,
         )
-        return web.Response(body=self._build_response_writer(bot=bot, result=result))
+        if result:
+            return Response(bot.session.json_dumps(result), media_type="application/json")
+        return Response(bot.session.json_dumps({}), media_type="application/json")
 
-    async def handle(self, request: web.Request) -> web.Response:
+    async def handle(self, request: Request) -> Response:
         bot = await self.resolve_bot(request)
         if self.handle_in_background:
             return await self._handle_request_background(bot=bot, request=request)
@@ -196,8 +161,7 @@ class SimpleRequestHandler(BaseRequestHandler):
     ) -> None:
         """
         :param dispatcher: instance of :class:`aiogram.dispatcher.dispatcher.Dispatcher`
-        :param handle_in_background: immediately respond to the Telegram instead of
-            waiting end of handler process
+        :param handle_in_background: immediately respond to the Telegram instead of waiting end of handler process
         :param bot: instance of :class:`aiogram.client.bot.Bot`
         """
         super().__init__(dispatcher=dispatcher, handle_in_background=handle_in_background, **data)
@@ -209,14 +173,13 @@ class SimpleRequestHandler(BaseRequestHandler):
         """
         await self.bot.session.close()
 
-    async def resolve_bot(self, request: web.Request) -> Bot:
+    async def resolve_bot(self, request: Request) -> Bot:
         return self.bot
 
 
 class TokenBasedRequestHandler(BaseRequestHandler):
     """
-    Handler that supports multiple bots, the context will be resolved
-    from path variable 'bot_token'
+    Handler that supports multiple bots, the context will be resolved from path variable 'bot_token'
     """
 
     def __init__(
@@ -228,8 +191,7 @@ class TokenBasedRequestHandler(BaseRequestHandler):
     ) -> None:
         """
         :param dispatcher: instance of :class:`aiogram.dispatcher.dispatcher.Dispatcher`
-        :param handle_in_background: immediately respond to the Telegram instead of
-            waiting end of handler process
+        :param handle_in_background: immediately respond to the Telegram instead of waiting end of handler process
         :param bot_settings: kwargs that will be passed to new Bot instance
         """
         super().__init__(dispatcher=dispatcher, handle_in_background=handle_in_background, **data)
@@ -242,7 +204,7 @@ class TokenBasedRequestHandler(BaseRequestHandler):
         for bot in self.bots.values():
             await bot.session.close()
 
-    def register(self, app: Application, /, path: str, **kwargs: Any) -> None:
+    def register(self, app: FastAPI, /, path: str, **kwargs: Any) -> None:
         """
         Validate path, register route and shutdown callback
 
@@ -254,14 +216,14 @@ class TokenBasedRequestHandler(BaseRequestHandler):
             raise ValueError("Path should contains '{bot_token}' substring")
         super().register(app, path=path, **kwargs)
 
-    async def resolve_bot(self, request: web.Request) -> Bot:
+    async def resolve_bot(self, request: Request) -> Bot:
         """
         Get bot token from path and create or get from cache Bot instance
 
         :param request:
         :return:
         """
-        token = request.match_info["bot_token"]
+        token = request.path_params["bot_token"]
         if token not in self.bots:
             self.bots[token] = Bot(token=token, **self.bot_settings)
         return self.bots[token]
