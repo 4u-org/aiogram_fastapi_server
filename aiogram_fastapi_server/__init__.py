@@ -98,7 +98,7 @@ class BaseRequestHandler(ABC):
         :param kwargs:
         """
         app.add_event_handler("shutdown", self._handle_close)
-        app.add_route("POST", path, self.handle, **kwargs)
+        app.add_route(path=path, route=self.handle, methods=["POST"])
 
     async def _handle_close(self, app: FastAPI) -> None:
         await self.close()
