@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aiogram-fastapi-server"
-version = "0.1.1"
+version = "0.1.2"
 description = "Handle webhook requests with FastAPI instead of aiohttp"
 authors = ["Snimshchikov Ilya <snimshchikov.ilya@gmail.com>"]
 license = "MIT"
